@@ -142,6 +142,8 @@ working directory and persisted session working directories, with symlinks
 resolved before the boundary check. It also implements a basic pipe-backed local
 shell terminal lifecycle for VS Code (`createTerminal`, terminal subscription,
 input/output, resize state, and disposal). It does not claim PTY or command
-detection support. Multi-chat, writable resources, and ACP v2 remain
-unsupported. Calls to unsupported methods return JSON-RPC `Method not found` or
+detection support. Multi-chat, writable resources, windowed delivery, and ACP
+v2 remain unsupported. A `subscribe` that offers `flowControl` is validated and
+then served with ordinary delivery. Calls to unsupported methods return
+JSON-RPC `Method not found` or
 `Invalid params`; they never return empty success placeholders.

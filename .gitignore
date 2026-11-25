@@ -1,8 +1,13 @@
 node_modules/
 dist/
 coverage/
+fix/
+.kilo/
+operator-logs/
 *.db
 *.db-shm
 *.db-wal
 .env
 ahp-acp-gateway.local.json
+AGENTS.md
+.gitignore

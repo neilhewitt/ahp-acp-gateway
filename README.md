@@ -299,7 +299,7 @@ AHP-ACP Gateway is a protocol bridge, not a sandbox.
   command detection are not implemented.
 - No MCP forwarding, forks, multi-user policy, or built-in sandbox.
 - Filesystem RPC requested by ACP agents is not advertised.
-- AHP windowed subscriptions are not implemented.
+- AHP windowed subscriptions are not implemented: an offered `flowControl` on `subscribe` is ignored and the subscription uses ordinary delivery.
 - The provider catalog is bundled and updated manually rather than synchronized
   automatically with the ACP Registry.
 

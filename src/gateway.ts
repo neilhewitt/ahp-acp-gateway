@@ -444,7 +444,7 @@ export class GatewayServer {
   private async subscribe(connection: Connection, params: Record<string, unknown>): Promise<unknown> {
     const channel = requireString(params.channel, 'channel');
     if (params.flowControl !== undefined) {
-      throw new RpcError(-32602, 'Windowed subscriptions are not implemented');
+      requireFlowControlOffer(params.flowControl);
     }
     const parsedChangeset = this.parseChangesetChannelWithStore(channel);
     if (parsedChangeset) {
@@ -2414,6 +2414,19 @@ function requireStringArray(value: unknown, field: string): string[] {
     throw new RpcError(-32602, `${field} must be an array of strings`);
   }
   return value;
+}
+
+function requireFlowControlOffer(value: unknown): void {
+  const invalid = (): RpcError => new RpcError(
+    -32602,
+    'flowControl must offer receive limits: integer windowBytes >= 1 and maxFrameBytes >= 1024',
+  );
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
+  const receive = (value as Record<string, unknown>).receive;
+  if (typeof receive !== 'object' || receive === null || Array.isArray(receive)) throw invalid();
+  const { windowBytes, maxFrameBytes } = receive as Record<string, unknown>;
+  if (!Number.isSafeInteger(windowBytes) || (windowBytes as number) < 1) throw invalid();
+  if (!Number.isSafeInteger(maxFrameBytes) || (maxFrameBytes as number) < 1024) throw invalid();
 }
 
 function optionalStringArray(value: unknown): string[] {
