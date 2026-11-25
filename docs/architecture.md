@@ -98,8 +98,8 @@ ACP session updates map to AHP actions in arrival order:
 | `agent_message_chunk` | markdown `chat/responsePart` + `chat/delta` |
 | `agent_thought_chunk` | reasoning part + `chat/reasoning` |
 | plan updates | markdown plan block |
-| `tool_call` | `chat/toolCallStart` and, when running, `chat/toolCallReady` |
-| `tool_call_update` | ready/complete tool lifecycle actions |
+| `tool_call` | one `chat/toolCallStart` per `toolCallId` in the turn, and, when running, `chat/toolCallReady` |
+| `tool_call_update` | starts the entry when the id is new, then ready/complete tool lifecycle actions |
 | permission request | pending-confirmation tool call with AHP options |
 | prompt stop | complete/cancel/error action with ACP reason metadata |
 | `available_commands_update` | cached slash-command AHP completions |
@@ -108,11 +108,20 @@ ACP session updates map to AHP actions in arrival order:
 | notice | concise system-notification response part |
 | unknown control update | bounded session metadata only; never assistant transcript text |
 
+Tool calls are keyed by `toolCallId` within a turn. ACP reports them as upserts,
+so a repeated `tool_call` or a `tool_call_update` for a known id updates the
+existing entry instead of adding a second one, and an id first seen in a
+`tool_call_update` is started from that update.
+
 Permission requests remain pending in the adapter until one AHP
-`chat/toolCallConfirmed` action resolves them. The gateway never chooses an
-approval option itself. It validates the active turn, pending tool state,
-selected option, approval/denial semantics, and ACP pending request before
-persisting the confirmation.
+`chat/toolCallConfirmed` action resolves them, and they stay answerable: status
+updates that arrive while a request is outstanding do not move the tool call out
+of `pending-confirmation`. The gateway never chooses an approval option itself.
+It validates the active turn, pending tool state, selected option,
+approval/denial semantics, and ACP pending request before persisting the
+confirmation. A request is answered `cancelled` when its turn ends, when the
+tool call finishes, or when a newer request for the same tool call supersedes
+it, so an agent is never left waiting for an answer it can no longer receive.
 
 Incoming AHP `Message.attachments` (`resource`, `embeddedResource`, `simple`,
 `annotations`, and `chat`) are translated into ACP `session/prompt`

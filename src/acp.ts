@@ -82,6 +82,21 @@ interface PendingPermission {
   options: acp.PermissionOption[];
 }
 
+// ACP reports tool calls as upserts keyed by toolCallId, so one turn holds at
+// most one entry per id however often the agent announces or updates it.
+interface ToolCallRecord {
+  ready: boolean;
+  finished: boolean;
+}
+
+interface ActiveAcpTurn {
+  id: string;
+  startedAt: number;
+  markdownPart?: string | undefined;
+  reasoningPart?: string | undefined;
+  toolCalls: Map<string, ToolCallRecord>;
+}
+
 class AcpV1Process implements AcpAdapter {
   readonly binding: AcpBinding;
   private readonly provider: ProviderConfig;
@@ -98,12 +113,7 @@ class AcpV1Process implements AcpAdapter {
   private ready = false;
   private stopResolve: (() => void) | undefined;
   private stderrTail = '';
-  private currentTurn: {
-    id: string;
-    startedAt: number;
-    markdownPart?: string | undefined;
-    reasoningPart?: string | undefined;
-  } | undefined;
+  private currentTurn: ActiveAcpTurn | undefined;
   private cancelRequested = false;
   private promptSettled: Promise<void> | undefined;
   private resolvePromptSettled: (() => void) | undefined;
@@ -277,7 +287,7 @@ class AcpV1Process implements AcpAdapter {
       if (!this.context || !this.binding.acpSessionId) {
         throw new Error('ACP process is not initialized');
       }
-      this.currentTurn = { id: turnId, startedAt };
+      this.currentTurn = { id: turnId, startedAt, toolCalls: new Map() };
       this.promptSettled = new Promise((resolve) => {
         this.resolvePromptSettled = resolve;
       });
@@ -340,6 +350,7 @@ class AcpV1Process implements AcpAdapter {
       } as StateAction);
     } finally {
       if (this.currentTurn?.id === turnId) this.currentTurn = undefined;
+      this.closePermissions();
       this.resolvePromptSettled?.();
       this.resolvePromptSettled = undefined;
     }
@@ -472,23 +483,23 @@ class AcpV1Process implements AcpAdapter {
     }
   }
 
-  private handlePermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
+  private handlePermission(
+    params: acp.RequestPermissionRequest,
+  ): Promise<acp.RequestPermissionResponse> | acp.RequestPermissionResponse {
     const turn = this.requireTurn();
     turn.markdownPart = undefined;
     turn.reasoningPart = undefined;
     const toolCallId = params.toolCall.toolCallId;
+    if (turn.toolCalls.get(toolCallId)?.finished) return { outcome: { outcome: 'cancelled' } };
     const title = params.toolCall.title ?? this.toolTitles.get(toolCallId) ?? toolCallId;
-    if (!this.toolTitles.has(toolCallId)) {
-      this.callbacks.emit({
-        type: ActionType.ChatToolCallStart,
-        turnId: turn.id,
-        toolCallId,
-        toolName: params.toolCall.name ?? toolCallId,
-        displayName: title,
-        intention: title,
-      } as StateAction);
-      this.toolTitles.set(toolCallId, title);
-    }
+    const started = this.startToolCall(turn, toolCallId, {
+      toolName: params.toolCall.name ?? toolCallId,
+      displayName: title,
+      intention: title,
+    });
+    this.toolTitles.set(toolCallId, title);
+    this.cancelPermission(toolCallId);
+    started.ready = true;
     this.callbacks.emit({
       type: ActionType.ChatToolCallReady,
       turnId: turn.id,
@@ -599,32 +610,22 @@ class AcpV1Process implements AcpAdapter {
         turn.reasoningPart = undefined;
         this.toolTitles.set(update.toolCallId, update.title);
         const toolInput = serializeToolInput(update.rawInput);
-        this.callbacks.emit({
-          type: ActionType.ChatToolCallStart,
-          turnId: turn.id,
-          toolCallId: update.toolCallId,
+        this.startToolCall(turn, update.toolCallId, {
           toolName: update.name ?? update.toolCallId,
           displayName: update.title,
           intention: update.title,
-        } as StateAction);
+        });
         if (
           update.status === 'in_progress'
           || update.status === 'completed'
           || update.status === 'failed'
           || toolInput !== undefined
         ) {
-          this.callbacks.emit({
-            type: ActionType.ChatToolCallReady,
-            turnId: turn.id,
-            toolCallId: update.toolCallId,
-            invocationMessage: update.title,
-            toolInput,
-            confirmed: ToolCallConfirmationReason.NotNeeded,
-          } as StateAction);
+          this.readyToolCall(turn, update.toolCallId, update.title, toolInput);
         }
         if (update.status === 'completed' || update.status === 'failed') {
           this.completeTool(
-            turn.id,
+            turn,
             update.toolCallId,
             update.status === 'completed',
             update.rawOutput,
@@ -640,28 +641,19 @@ class AcpV1Process implements AcpAdapter {
         }
         const title = update.title ?? this.toolTitles.get(update.toolCallId) ?? update.toolCallId;
         const toolInput = serializeToolInput(update.rawInput);
+        const record = this.startToolCall(turn, update.toolCallId, {
+          toolName: update.name ?? update.toolCallId,
+          displayName: title,
+          intention: title,
+        });
         if (update.status === 'in_progress') {
-          this.callbacks.emit({
-            type: ActionType.ChatToolCallReady,
-            turnId: turn.id,
-            toolCallId: update.toolCallId,
-            invocationMessage: title,
-            toolInput,
-            confirmed: ToolCallConfirmationReason.NotNeeded,
-          } as StateAction);
+          this.readyToolCall(turn, update.toolCallId, title, toolInput);
         } else if (update.status === 'completed' || update.status === 'failed') {
-          if (toolInput !== undefined) {
-            this.callbacks.emit({
-              type: ActionType.ChatToolCallReady,
-              turnId: turn.id,
-              toolCallId: update.toolCallId,
-              invocationMessage: title,
-              toolInput,
-              confirmed: ToolCallConfirmationReason.NotNeeded,
-            } as StateAction);
+          if (toolInput !== undefined || !record.ready) {
+            this.readyToolCall(turn, update.toolCallId, title, toolInput);
           }
           this.completeTool(
-            turn.id,
+            turn,
             update.toolCallId,
             update.status === 'completed',
             update.rawOutput,
@@ -732,14 +724,62 @@ class AcpV1Process implements AcpAdapter {
     } as StateAction);
   }
 
+  // Emits chat/toolCallStart once per toolCallId in the turn; later ACP reports
+  // for the same id update that entry instead of adding another.
+  private startToolCall(
+    turn: ActiveAcpTurn,
+    toolCallId: string,
+    fields: { toolName: string; displayName: string; intention: string },
+  ): ToolCallRecord {
+    const existing = turn.toolCalls.get(toolCallId);
+    if (existing) return existing;
+    const record: ToolCallRecord = { ready: false, finished: false };
+    turn.toolCalls.set(toolCallId, record);
+    this.callbacks.emit({
+      type: ActionType.ChatToolCallStart,
+      turnId: turn.id,
+      toolCallId,
+      ...fields,
+    } as StateAction);
+    return record;
+  }
+
+  private readyToolCall(
+    turn: ActiveAcpTurn,
+    toolCallId: string,
+    title: string,
+    toolInput: string | undefined,
+  ): void {
+    const record = turn.toolCalls.get(toolCallId);
+    if (record) record.ready = true;
+    this.callbacks.emit({
+      type: ActionType.ChatToolCallReady,
+      turnId: turn.id,
+      toolCallId,
+      invocationMessage: title,
+      toolInput,
+      // While a permission request is outstanding the entry must stay
+      // pending-confirmation, otherwise the client has nothing to answer.
+      ...(this.permissions.has(toolCallId) ? {} : { confirmed: ToolCallConfirmationReason.NotNeeded }),
+    } as StateAction);
+  }
+
+  private cancelPermission(toolCallId: string): void {
+    const pending = this.permissions.get(toolCallId);
+    if (!pending) return;
+    this.permissions.delete(toolCallId);
+    pending.resolve({ outcome: { outcome: 'cancelled' } });
+  }
+
   private completeTool(
-    turnId: string,
+    turn: ActiveAcpTurn,
     toolCallId: string,
     success: boolean,
     rawOutput: unknown,
     acpContent?: unknown[] | null,
     title?: string,
   ): void {
+    const turnId = turn.id;
     const { content, summaryText } = this.translateToolCallContent(turnId, toolCallId, acpContent);
     const rawOutputContent = extractRawOutputText(rawOutput);
     const fallbackTitle = title && title !== toolCallId ? title : undefined;
@@ -759,6 +799,9 @@ class AcpV1Process implements AcpAdapter {
         ...(success ? {} : { error: { message: summaryText ?? rawOutputContent ?? 'ACP tool reported failure' } }),
       },
     } as StateAction);
+    const record = turn.toolCalls.get(toolCallId);
+    if (record) record.finished = true;
+    this.cancelPermission(toolCallId);
   }
 
   private translateToolCallContent(
@@ -938,12 +981,7 @@ class AcpV1Process implements AcpAdapter {
     this.callbacks.controlUpdate('configOptions', { values });
   }
 
-  private requireTurn(): {
-    id: string;
-    startedAt: number;
-    markdownPart?: string | undefined;
-    reasoningPart?: string | undefined;
-  } {
+  private requireTurn(): ActiveAcpTurn {
     if (!this.currentTurn) throw new Error('ACP requested permission outside an active turn');
     return this.currentTurn;
   }
